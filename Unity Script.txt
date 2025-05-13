@@ -1,0 +1,155 @@
+using UnityEngine;
+using WebSocketSharp;
+using System.Collections.Generic;
+
+public class WebSocketClient : MonoBehaviour
+{
+    public GameObject mug; // Assign the Mug GameObject in the Inspector
+
+    private WebSocket ws;
+    private Queue<string> messageQueue = new Queue<string>(); // Thread-safe queue for incoming messages
+
+    // Movement variables
+    private Vector3 velocity = Vector3.zero; // Accumulated velocity from acceleration
+    private Vector3 position = Vector3.zero; // Position for translation
+
+    // Tunable Parameters (exposed as public for easy tweaking in the Inspector)
+    public float rotationSensitivity = 300f;   // Gyroscope rotation sensitivity
+    public float translationFactor = 5f;         // Accelerometer translation factor (increased for faster linear motion)
+    public float damping = 0.98f;                // Damping to reduce velocity drift over time
+    public float accelThreshold = 0.05f;         // Dead zone threshold for accelerometer noise
+
+    // Sensor-to-Unity axis multipliers: adjust these in the Inspector for proper alignment.
+    // For translation: tweak these if the mug moves in the opposite direction of sensor input.
+    public float accMultiplierX = -1f;  // Corrects left/right inversion
+    public float accMultiplierY = -1f;  // Corrects up/down inversion
+    public float accMultiplierZ = 1f;   // Use sensor Z reading as is
+
+    // For rotation: adjust these if the mug's rotation seems inverted.
+    public float gyroMultiplierX = -1f;
+    public float gyroMultiplierY = -1f;
+    public float gyroMultiplierZ = 1f;
+
+    // Boundaries for translation (defines a box within which the mug can move)
+    public float limitX = 1.0f;
+    public float limitY = 1.0f;
+    public float limitZ = 1.0f;
+
+    void Start()
+    {
+        ws = new WebSocket("ws://192.168.4.1:81/");
+        ws.OnMessage += (sender, e) =>
+        {
+            lock (messageQueue)
+            {
+                messageQueue.Enqueue(e.Data); // Enqueue incoming WebSocket data safely
+            }
+        };
+        ws.Connect();
+    }
+
+    void Update()
+    {
+        // Process sensor data from the WebSocket if available.
+        if (messageQueue.Count > 0)
+        {
+            string jsonData = "";
+            lock (messageQueue)
+            {
+                jsonData = messageQueue.Dequeue();
+            }
+
+            try
+            {
+                MotionData data = JsonUtility.FromJson<MotionData>(jsonData);
+
+                // --- ROTATION ---
+                // Calculate new rotation using gyroscope data with calibrated multipliers.
+                Vector3 newRotation = new Vector3(
+                    data.gx * gyroMultiplierX,
+                    data.gy * gyroMultiplierY,
+                    data.gz * gyroMultiplierZ
+                ) * rotationSensitivity;
+                mug.transform.Rotate(newRotation * Time.deltaTime);
+
+                // --- TRANSLATION ---
+                // Get acceleration from the sensor and apply the mapping multipliers.
+                Vector3 acceleration = new Vector3(
+                    data.ax * accMultiplierX,
+                    data.ay * accMultiplierY,
+                    data.az * accMultiplierZ
+                );
+
+                // Apply a dead zone to filter out small, unwanted noise.
+                if (Mathf.Abs(acceleration.x) < accelThreshold) acceleration.x = 0;
+                if (Mathf.Abs(acceleration.y) < accelThreshold) acceleration.y = 0;
+                if (Mathf.Abs(acceleration.z) < accelThreshold) acceleration.z = 0;
+
+                // Integrate acceleration into velocity with the specified translation factor.
+                velocity += acceleration * translationFactor * Time.deltaTime;
+                velocity *= damping; // Smooth out movement using damping
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError("Error parsing WebSocket data: " + ex.Message);
+            }
+        }
+
+        // --- SIMULATED INPUT (Editor Only) ---
+        // Use arrow keys for testing translation when sensor data is not sufficient.
+#if UNITY_EDITOR
+        if (Input.GetKey(KeyCode.LeftArrow))
+        {
+            velocity.x -= translationFactor * Time.deltaTime;
+        }
+        if (Input.GetKey(KeyCode.RightArrow))
+        {
+            velocity.x += translationFactor * Time.deltaTime;
+        }
+        if (Input.GetKey(KeyCode.UpArrow))
+        {
+            // Up arrow increases Y (moves the mug upward)
+            velocity.y += translationFactor * Time.deltaTime;
+        }
+        if (Input.GetKey(KeyCode.DownArrow))
+        {
+            // Down arrow decreases Y (moves the mug downward)
+            velocity.y -= translationFactor * Time.deltaTime;
+        }
+#endif
+
+        // --- POSITION INTEGRATION & BOUNDARY CHECKS ---
+        // Update the current position based on the velocity.
+        position += velocity * Time.deltaTime;
+
+        // Clamp the position so it remains within the defined boundaries.
+        position.x = Mathf.Clamp(position.x, -limitX, limitX);
+        position.y = Mathf.Clamp(position.y, -limitY, limitY);
+        position.z = Mathf.Clamp(position.z, -limitZ, limitZ);
+
+        // Reset velocity along any axis that has hit its boundary.
+        if (Mathf.Abs(position.x) >= limitX) velocity.x = 0;
+        if (Mathf.Abs(position.y) >= limitY) velocity.y = 0;
+        if (Mathf.Abs(position.z) >= limitZ) velocity.z = 0;
+
+        // Apply the final calculated position to the mug.
+        mug.transform.localPosition = position;
+
+        // Debug logs to help you verify position and velocity during testing.
+        Debug.Log("Position: " + position + " | Velocity: " + velocity);
+    }
+
+    void OnApplicationQuit()
+    {
+        if (ws != null)
+        {
+            ws.Close();
+        }
+    }
+
+    [System.Serializable]
+    public class MotionData
+    {
+        public float ax, ay, az, gx, gy, gz;
+    }
+}

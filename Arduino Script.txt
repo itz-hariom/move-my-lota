@@ -1,0 +1,99 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <WebServer.h>
+#include <ArduinoWebsockets.h>
+
+using namespace websockets;
+
+const char* ssid = "ESP32_Hotspot";
+const char* password = "12345678";
+
+Adafruit_MPU6050 mpu;
+WebServer server(80);
+WebsocketsServer wsServer;
+WebsocketsClient client;
+
+int zeroDataCount = 0;             // Counter for consecutive 0s
+const int maxZeroThreshold = 10;   // Max allowed zero data before reset
+
+bool sensorInitialized = false;
+
+void setupMPU() {
+    if (!mpu.begin()) {
+        Serial.println("MPU6050 not found! Check wiring.");
+        sensorInitialized = false;
+    } else {
+        Serial.println("MPU6050 initialized.");
+        sensorInitialized = true;
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(21, 22);
+    Wire.setClock(100000); // safer I2C speed
+
+    WiFi.softAP(ssid, password);
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.softAPIP());
+
+    setupMPU();
+
+    wsServer.listen(81);
+    server.on("/", HTTP_GET, []() {
+        server.send(200, "text/html", "<h1>ESP32 WebSocket Server Running</h1>");
+    });
+    server.begin();
+}
+
+void loop() {
+    server.handleClient();
+
+    // Accept client connection
+    if (wsServer.poll() && !client.available()) {
+        client = wsServer.accept();
+        Serial.println("WebSocket Client Connected!");
+    }
+
+    if (client.available() && sensorInitialized) {
+        sensors_event_t a, g, temp;
+        mpu.getEvent(&a, &g, &temp);
+
+        // Detect if all-zero data
+        bool isZeroData = (
+            a.acceleration.x == 0 && a.acceleration.y == 0 && a.acceleration.z == 0 &&
+            g.gyro.x == 0 && g.gyro.y == 0 && g.gyro.z == 0
+        );
+
+        if (isZeroData) {
+            zeroDataCount++;
+            Serial.println("⚠️ Zero data detected!");
+        } else {
+            zeroDataCount = 0; // reset if data is valid
+        }
+
+        // If too many zero readings, try to reinit safely
+        if (zeroDataCount >= maxZeroThreshold) {
+            Serial.println("🔁 Too many zero readings. Reinitializing MPU...");
+            setupMPU();
+            zeroDataCount = 0;
+            delay(100); // small cooldown
+            return;
+        }
+
+        // Send data only if not zero (optional)
+        String json = "{\"ax\":" + String(a.acceleration.x) +
+                      ",\"ay\":" + String(a.acceleration.y) +
+                      ",\"az\":" + String(a.acceleration.z) +
+                      ",\"gx\":" + String(g.gyro.x) +
+                      ",\"gy\":" + String(g.gyro.y) +
+                      ",\"gz\":" + String(g.gyro.z) + "}";
+
+        client.send(json);
+        Serial.println("Sent: " + json);
+
+        delay(100); // Tune this for refresh rate
+    }
+}
